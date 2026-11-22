@@ -1,0 +1,433 @@
+--- ../_stage3_originals/main.py	2026-11-22 16:32:44.579703104 +0000
++++ main.py	2026-11-22 16:42:16.672325080 +0000
+@@ -1,6 +1,46 @@
+ # main.py
+ # Tsclp_v2.2_volatile — основной цикл (ТОЛЬКО ПЕСОЧНИЦА).
+ #
++# ИЗМЕНЕНИЯ (SAFETY FIX ЭТАП 3 — NOT_FOUND 50005, SELL confirmation, защита
++#            от дублирующих заявок; основание — отчёт ЭТАПА 2 от 2026-11-22):
++#   Исправление №1 (execution.resolve_uncertain + process_closing): отсутствие
++#      позиции в портфеле при незавершённой/неопределённой SELL (close_order_id
++#      / запись close_orders) БОЛЬШЕ НЕ закрывает позицию как CLOSED —
++#      позиция остаётся UNCERTAIN с сохранением количества/FIGI/entry price/
++#      order_id SELL (исход "SELL_CLOSURE_UNCONFIRMED", событие
++#      SELL_CLOSURE_UNCONFIRMED один раз на (FIGI, trade_id, order_id));
++#      P&L не формируется. Отсутствие позиции БЕЗ незавершённой SELL —
++#      EXTERNAL_CLOSE (logged=True, close_reason="EXTERNAL_CLOSE", событие
++#      POSITION_EXTERNAL_CLOSE) — без торговой CSV-строки и P&L.
++#   Исправление №2 (poll_open_orders): добавлен полноценный опрос незавершённых
++#      SELL-заявок (open_orders(side="SELL")) через существующий
++#      get_sandbox_order_state. Подтверждённый FILL — применение через штатный
++#      apply_close_execution (цена — только extract_price_from_order_state,
++#      этап 1; частичное исполнение не считается полным закрытием).
++#      NOT_FOUND/None/timeout — НЕ исполнение: заявка остаётся в реестре,
++#      позиция не закрывается, блокировка повторной SELL сохраняется.
++#      NEW — наблюдение; CANCELLED/REJECTED/EXPIRED — только по фактическому
++#      терминальному статусу брокера, исполнение не выдумывается. Семантика
++#      BUY-поллинга не менялась.
++#   Исправление №3 (close_position + _sell_blocked_reason): защита от повторной
++#      SELL, симметричная figi_blocks_buy: незавершённая/неопределённая SELL
++#      по FIGI в реестре (включая NOT_FOUND->UNCERTAIN, state=None),
++#      UNCERTAIN-состояние позиции или незавершённая SELL в учёте позиции
++#      запрещают отправку непосредственно ПЕРЕД post_market_order (событие
++#      SELL_DUPLICATE_BLOCKED). Повторная SELL допускается только после
++#      достоверного терминального разрешения предыдущей заявки.
++#   Исправление №4 (process_closing): при неизвестной цене выхода
++#      (execution_price отсутствует/<=0) обычная строка сделки с P&L НЕ
++#      формируется: цена входа не подставляется как цена выхода, последняя
++#      котировка не используется, фиктивный нулевой P&L не пишется; событие
++#      PRICE_UNKNOWN фиксируется (один раз на (FIGI, trade_id)); позиция
++#      остаётся CLOSED с logged=False — при появлении достоверной цены
++#      (apply_close_execution обновляет execution_price) сделка записывается
++#      штатным путём.
++#   Не менялись: стратегия/сигналы/SL/TP/комиссии/размер позиции/FORCE_TRADE,
++#      алгоритм отправки заявок и идемпотентность, BUY-поллинг, recovery,
++#      reconciliation, order_ledger.py, tinkoff_client.py.
++#
+ # ИЗМЕНЕНИЯ (PRICE FIX — раздельное преобразование цены исполнения):
+ #   - Универсальная ExecutionMonitor._extract_price удалена (execution.py).
+ #     PostOrderResponse (ответ post_sandbox_order): executed_order_price —
+@@ -318,7 +358,9 @@
+ from risk_manager import RiskManager
+ from strategy import StrategyManager
+ from tinkoff_client import TinkoffClient, PositionData
+-from execution import ExecutionMonitor, PositionState, ACTIVE_STATES
++from execution import (
++    ExecutionMonitor, PositionState, ACTIVE_STATES, has_unresolved_sell,
++)
+ from screener import Screener
+ 
+ if config.ENABLE_TELEGRAM:
+@@ -434,6 +476,17 @@
+ _strategy_event_keys = set()
+ _promote_throttle = {"n": 0, "alive": 0}
+ 
++# SAFETY FIX ЭТАП 3 (исправление №4): дедупликация события PRICE_UNKNOWN —
++# один раз на (FIGI, trade_id) за время жизни процесса; после перезапуска
++# событие может быть записано повторно (CSV-guard идемпотентен всегда).
++_price_unknown_reported = set()
++
++# SAFETY FIX ЭТАП 3 (исправление №1): дедупликация события
++# SELL_CLOSURE_UNCONFIRMED — один раз на (FIGI, trade_id, close_order_id)
++# за время жизни процесса; позиция при этом продолжает оставаться в
++# UNCERTAIN и видимой сверке (reconcile), опрос SELL продолжается.
++_sell_unconfirmed_alerted = set()
++
+ 
+ def is_trading_enabled() -> bool:
+     return os.path.exists(TRADING_FLAG)
+@@ -895,7 +948,58 @@
+ # CLOSE / PROCESS CLOSING
+ # ============================================================
+ 
++def _sell_blocked_reason(pos, ledger: Optional[OrderLedger]) -> Optional[str]:
++    """
++    SAFETY FIX ЭТАП 3 (исправление №3): причина запрета отправки SELL или None.
++
++    Симметрично figi_blocks_buy для BUY. Повторная SELL по FIGI запрещена,
++    пока:
++      - в реестре есть незавершённая/неопределённая SELL-заявка по этому FIGI
++        (INTENT/SENT/NEW/PARTIALLYFILL/UNCERTAIN — в том числе после NOT_FOUND/
++        state=None/timeout: такие заявки переводятся в UNCERTAIN и остаются
++        в реестре);
++      - или позиция находится в UNCERTAIN (фактический остаток не подтверждён;
++        в том числе когда портфель временно показывает прежнее количество);
++      - или в учёте позиции есть незавершённая SELL (курсор close_order_id /
++        незавершённая запись close_orders) — в том числе после перезапуска
++        (курсор и журнал сериализуются в state.json).
++    Повторная SELL допускается только после достоверного ТЕРМИНАЛЬНОГО статуса
++    предыдущей заявки в реестре, снятого курсора и подтверждённого остатка
++    позиции (сверка/apply_close_execution). Наличие новой причины закрытия
++    (SL/TP) само по себе разрешением не является.
++    """
++    if ledger is not None and ledger.figi_has_open_order(pos.figi, side="SELL"):
++        return ("в реестре есть незавершённая/неопределённая SELL-заявка "
++                f"по FIGI {pos.figi}")
++    if pos.state == PositionState.UNCERTAIN:
++        return ("позиция в состоянии UNCERTAIN — фактический остаток "
++                "не подтверждён")
++    if has_unresolved_sell(pos):
++        return ("у позиции есть незавершённая/неопределённая SELL-заявка "
++                f"(close_order_id={pos.close_order_id or '—'})")
++    return None
++
++
+ async def close_position(client: TinkoffClient, pos, price: float):
++    # SAFETY FIX ЭТАП 3 (исправление №3): проверка выполняется НЕПОСРЕДСТВЕННО
++    # перед отправкой SELL (а не только при формировании сигнала). Запрещённая
++    # отправка не создаёт INTENT и не выполняет сетевой вызов.
++    blocked_reason = _sell_blocked_reason(pos, ledger_ref)
++    if blocked_reason:
++        logging.error(
++            f"[close] {pos.ticker}: повторная SELL ЗАПРЕЩЕНА — {blocked_reason} "
++            f"(figi={pos.figi}, state={pos.state.value}, "
++            f"close_order_id={pos.close_order_id or '—'})"
++        )
++        research_logger.log_event("SELL_DUPLICATE_BLOCKED", {
++            "trade_id": pos.trade_id, "ticker": pos.ticker, "figi": pos.figi,
++            "close_order_id": pos.close_order_id,
++            "position_state": pos.state.value,
++            "requested_lots": pos.quantity,
++            "reason": blocked_reason,
++        })
++        return
++
+     direction = (
+         OrderDirection.ORDER_DIRECTION_SELL if pos.direction == "BUY"
+         else OrderDirection.ORDER_DIRECTION_BUY
+@@ -981,7 +1085,59 @@
+             broker = {f: p for f, p in positions.items()
+                       if not f.startswith(("RUB", "USD", "EUR"))}
+             for pos in uncertain_positions:
+-                monitor.resolve_uncertain(pos, broker)
++                # SAFETY FIX ЭТАП 3 (исправления №1 и №8): исход разрешения
++                # фиксируется в журнале событий; позиция с незавершённой SELL
++                # при отсутствии в портфеле остаётся UNCERTAIN (НЕ CLOSED).
++                outcome = monitor.resolve_uncertain(pos, broker)
++                if outcome == "SELL_CLOSURE_UNCONFIRMED":
++                    alert_key = (pos.figi, pos.trade_id, pos.close_order_id)
++                    if alert_key not in _sell_unconfirmed_alerted:
++                        _sell_unconfirmed_alerted.add(alert_key)
++                        logging.error(
++                            f"[process_closing] {pos.ticker}: закрытие SELL не "
++                            f"подтверждено (order_id={pos.close_order_id or '—'}) — "
++                            f"позиция остаётся UNCERTAIN, P&L не формируется"
++                        )
++                        research_logger.log_event("SELL_CLOSURE_UNCONFIRMED", {
++                            "figi": pos.figi, "ticker": pos.ticker,
++                            "trade_id": pos.trade_id,
++                            "close_order_id": pos.close_order_id,
++                            "quantity": pos.quantity,
++                            "close_order_statuses": {
++                                oid: rec.get("status")
++                                for oid, rec in (pos.close_orders or {}).items()
++                            },
++                            "reason": ("позиция отсутствует в портфеле при "
++                                       "незавершённой/неопределённой SELL — закрытие "
++                                       "не подтверждено, P&L не формируется, заявка "
++                                       "доступна опросу"),
++                        })
++                        await notify(
++                            f"⚠️ <b>{pos.ticker}</b>: позиция отсутствует в портфеле, "
++                            f"но исполнение SELL не подтверждено (order_id="
++                            f"{pos.close_order_id or '—'}). Позиция UNCERTAIN, "
++                            f"повторная SELL запрещена, P&L не записан. "
++                            f"Требуется сверка."
++                        )
++                elif outcome == "EXTERNAL_CLOSE":
++                    logging.warning(
++                        f"[process_closing] {pos.ticker}: внешнее закрытие "
++                        f"(EXTERNAL_CLOSE) — без торговой CSV-строки и P&L"
++                    )
++                    research_logger.log_event("POSITION_EXTERNAL_CLOSE", {
++                        "figi": pos.figi, "ticker": pos.ticker,
++                        "trade_id": pos.trade_id,
++                        "entry_order_id": pos.entry_order_id,
++                        "quantity_before": pos.quantity,
++                        "reason": ("позиция отсутствует в портфеле, незавершённой "
++                                   "SELL-заявки в реестре нет — учёт закрыт как "
++                                   "внешнее закрытие, торговый P&L не рассчитывается"),
++                    })
++                    await notify(
++                        f"ℹ️ <b>{pos.ticker}</b>: позиция отсутствует в портфеле, "
++                        f"незавершённой SELL нет — учтено как внешнее закрытие "
++                        f"(EXTERNAL_CLOSE), без P&L."
++                    )
+             await reconcile(client, monitor)
+ 
+     for pos in list(monitor.positions.values()):
+@@ -994,7 +1150,7 @@
+             pos.logged = True
+             continue
+ 
+-        exit_price = pos.execution_price or 0.0
++        exit_price_raw = pos.execution_price
+         executed_lots = pos.executed_lots
+         if executed_lots <= 0:
+             logging.error(
+@@ -1002,6 +1158,44 @@
+             )
+             pos.logged = True
+             continue
++
++        # SAFETY FIX ЭТАП 3 (исправление №4): неизвестная цена выхода.
++        # Если фактическая цена SELL не подтверждена — обычная строка завершённой
++        # сделки с P&L НЕ формируется: цена входа не подставляется как цена
++        # выхода, последняя котировка не используется, фиктивный нулевой P&L
++        # не пишется, неизвестная цена не считается нулём. Позиция остаётся
++        # CLOSED с logged=False: при появлении достоверной цены (повторный
++        # опрос/apply_close_execution обновляет execution_price) сделка будет
++        # записана штатным путём. Причина PRICE_UNKNOWN фиксируется в журнале.
++        if exit_price_raw is None or exit_price_raw <= 0:
++            pu_key = (pos.figi, trade_id)
++            if pu_key not in _price_unknown_reported:
++                _price_unknown_reported.add(pu_key)
++                logging.error(
++                    f"[csv] {pos.ticker}: цена исполнения SELL не подтверждена "
++                    f"(execution_price={exit_price_raw!r}, order_id="
++                    f"{pos.close_order_id or '—'}) — строка сделки с P&L не "
++                    f"формируется (PRICE_UNKNOWN), позиция остаётся для сверки"
++                )
++                research_logger.log_event("PRICE_UNKNOWN", {
++                    "trade_id": trade_id, "ticker": pos.ticker, "figi": pos.figi,
++                    "close_order_id": pos.close_order_id,
++                    "executed_lots": executed_lots, "lot_size": pos.lot_size,
++                    "entry_price": pos.entry_price,
++                    "execution_price": exit_price_raw,
++                    "close_reason": pos.close_reason or "",
++                    "reason": ("цена исполнения SELL не подтверждена — обычная "
++                               "строка сделки с P&L не формируется; цена входа и "
++                               "последняя котировка не подставляются"),
++                })
++                await notify(
++                    f"⏳ <b>{pos.ticker}</b>: исполнение SELL подтверждено, но цена "
++                    f"выхода не подтверждена (PRICE_UNKNOWN) — сделка без P&L, "
++                    f"продолжается сверка (order_id={pos.close_order_id or '—'})."
++                )
++            continue
++
++        exit_price = float(exit_price_raw)
+         shares = executed_lots * pos.lot_size
+ 
+         entry_slippage = (pos.entry_price - pos.price_before_order) * shares
+@@ -2171,6 +2365,180 @@
+         ledger.record_status(order_id, status or "NEW", executed_lots=le,
+                              reason="активна (сторона неизвестна)", source="poll_unknown")
+ 
++    # SAFETY FIX ЭТАП 3 (исправление №2): полноценный опрос незавершённых
++    # SELL-заявок (симметрично BUY-ветке выше). Источник заявок — реестр
++    # (open_orders(side="SELL"): нетерминальные + терминальные с residual-
++    # исполнением), состояние — существующий get_sandbox_order_state(order_id).
++    # Ключевые правила:
++    #   A. Подтверждённый FILL (в т.ч. частичный): проверка привязки к позиции
++    #      (FIGI + order_id + сторона), применение фактического исполнения
++    #      через штатный apply_close_execution; цена — ТОЛЬКО
++    #      extract_price_from_order_state (Этап 1), самостоятельное
++    #      преобразование цены запрещено. Закрывается только подтверждённое
++    #      количество; частичное исполнение НЕ считается полным закрытием.
++    #   B. NOT_FOUND/None/timeout/ошибка: заявка НЕ считается исполненной,
++    #      позиция не закрывается, заявка не удаляется из реестра, блокировка
++    #      повторной SELL сохраняется — неопределённость продолжает опрос.
++    #   C. NEW (без исполнения): наблюдение; позиция не закрывается, вторая
++    #      SELL не отправляется (защита исправления №3).
++    #   D. CANCELLED/REJECTED/EXPIRED: только по фактическому терминальному
++    #      статусу брокера; отказ/отмена не путаются с исполнением, остаток
++    #      позиции остаётся учтённым (apply_close_execution снимает курсор
++    #      закрытия и возвращает позицию в OPEN без списания).
++    for rec in list(ledger.open_orders(side="SELL")):
++        order_id = rec["order_id"]
++        figi = rec.get("figi") or ""
++        ticker = rec.get("ticker") or figi or "?"
++        rec_status = rec.get("status")
++        recorded_le = int(rec.get("executed_lots") or 0)
++
++        # B: статус недоступен/заявка не найдена — НЕ подтверждение исполнения.
++        state = await client.get_sandbox_order_state(order_id)
++        if state is None:
++            logging.warning(
++                f"[poll-sell] {ticker}: статус SELL-заявки {order_id} недоступен "
++                f"— заявка остаётся в реестре (неопределённость, НЕ исполнение), "
++                f"позиция не закрывается, блокировка повторной SELL сохранена"
++            )
++            continue
++
++        status = _status_name(getattr(state, "execution_report_status", None))
++        le = int(getattr(state, "lots_executed", 0) or 0)
++
++        # Дефект №8 (аналог BUY): FILL без подтверждённых лотов — противоречие,
++        # НЕ подтверждение исполнения; заявка остаётся UNCERTAIN в реестре.
++        if status == "FILL" and le <= 0:
++            logging.error(
++                f"[poll-sell] {ticker}: SELL {order_id}: FILL, но lots_executed={le} "
++                f"— противоречие, UNCERTAIN (заявка остаётся в реестре)"
++            )
++            client.uncertain_state = True
++            ledger.record_uncertain(order_id, figi=figi, ticker=ticker,
++                                    side="SELL", executed_lots=le,
++                                    reason="FILL противоречие: lots_executed=0 при опросе SELL",
++                                    source="poll_sell")
++            continue
++
++        # Идемпотентность (аналог партии P0-2 для BUY): терминальная запись
++        # реестра с уже учтённым исполнением повторно не применяется и не
++        # перезаписывается — защита от двойного списания количества и от
++        # бесконечных повторных записей в журнал.
++        if rec_status in _TERMINAL_ORDER_STATUSES and le <= recorded_le:
++            continue
++
++        # Привязка к позиции учёта: исполнение применяется ТОЛЬКО к позиции,
++        # которая знает эту заявку (FIGI совпадает по построению поиска позиции,
++        # order_id — в журнале close_orders или в курсоре close_order_id;
++        # SELL закрывает только позицию направления BUY).
++        pos = monitor.get_position(figi) if figi else None
++        linked = (
++            pos is not None
++            and pos.direction == "BUY"
++            and (order_id in pos.close_orders or pos.close_order_id == order_id)
++        )
++
++        # D: достоверный отказ/отмена/истечение БЕЗ исполнения (терминальный
++        # статус брокера): исполнение НЕ выдумывается, остаток позиции остаётся
++        # учтённым; курсор закрытия снимается штатным apply_close_execution.
++        if status in ("REJECTED", "CANCELLED", "EXPIRED") and le <= 0:
++            logging.warning(
++                f"[poll-sell] {ticker}: SELL {order_id} {status} без исполнения — "
++                f"заявка закрыта в реестре, остаток позиции сохранён"
++            )
++            if linked:
++                monitor.apply_close_execution(
++                    pos, order_id, 0, status, None,
++                    ExecutionMonitor._extract_commission(state),
++                    requested_lots=int(rec.get("requested_lots") or 0) or None,
++                )
++                _save_state_checked(monitor, rm)
++            ledger.record_status(order_id, status, executed_lots=le,
++                                 reason="достоверный отказ/отмена SELL без исполнения",
++                                 source="poll_sell")
++            continue
++
++        if status == "FILL" or le > 0 or status == "PARTIALLYFILL":
++            # A: подтверждённое исполнение (полное или частичное).
++            if not linked:
++                if status in _TERMINAL_ORDER_STATUSES:
++                    # Позиция учёта не знает заявку (закрыта/перезаписана новой
++                    # позицией по тому же FIGI), но брокер достоверно подтверждает
++                    # терминальный статус — разрешение записи по факту брокера
++                    # (как в startup_recovery). Применение к учёту НЕ выполняется:
++                    # заявка не привязана к активной позиции.
++                    ledger.record_status(order_id, status, executed_lots=le,
++                                         reason="терминальный статус SELL подтверждён "
++                                                "брокером; активная позиция учёта "
++                                                "отсутствует — автоприменение не выполнялось",
++                                         source="poll_sell")
++                else:
++                    client.uncertain_state = True
++                    ledger.record_uncertain(order_id, figi=figi, ticker=ticker,
++                                            side="SELL", executed_lots=le,
++                                            reason="исполнение SELL не привязано к позиции "
++                                                   "учёта — автоприменение запрещено, "
++                                                   "требуется сверка/оператор",
++                                            source="poll_sell")
++                continue
++
++            requested = (int(rec.get("requested_lots") or 0)
++                         or int(pos.close_requested_lots or 0) or None)
++            # PRICE FIX (Этап 1): цена — только extract_price_from_order_state;
++            # самостоятельное преобразование цены не создаётся.
++            exec_price = ExecutionMonitor.extract_price_from_order_state(
++                state, le, pos.lot_size)
++            applied = monitor.apply_close_execution(
++                pos, order_id, le, status or "SENT", exec_price,
++                ExecutionMonitor._extract_commission(state),
++                requested_lots=requested,
++            )
++            # Аналог resolve_closing: FILL с исполнением меньше запрошенного —
++            # противоречие неполного рыночного исполнения: подтверждённая часть
++            # применена, остаток — неопределённость (не считается закрытием).
++            if (applied and status == "FILL" and requested
++                    and le < requested and pos.state != PositionState.CLOSED):
++                pos.state = PositionState.UNCERTAIN
++            if applied:
++                _save_state_checked(monitor, rm)
++                research_logger.log_event("SELL_FILL_APPLIED", {
++                    "order_id": order_id, "figi": figi, "ticker": ticker,
++                    "trade_id": rec.get("trade_id") or (pos.trade_id if pos else ""),
++                    "executed_lots": le, "requested_lots": requested,
++                    "avg_exec_price": exec_price,
++                    "price_known": bool(exec_price and exec_price > 0),
++                    "position_state": pos.state.value,
++                    "position_quantity": pos.quantity,
++                    "full_close": bool(requested and le >= requested
++                                       and pos.state == PositionState.CLOSED),
++                    "source": "poll_sell",
++                })
++                if exec_price is None or exec_price <= 0:
++                    # Исправление №4: лоты подтверждены, цена — нет: цена НЕ
++                    # выдумывается, P&L не формируется (PRICE_UNKNOWN).
++                    logging.error(
++                        f"[poll-sell] {ticker}: исполнение {le} лот. SELL "
++                        f"{order_id} подтверждено, цена НЕ подтверждена — "
++                        f"P&L не формируется (PRICE_UNKNOWN)"
++                    )
++            # Терминальное разрешение в реестре: полный FILL закрывает запись;
++            # частичное терминальное исполнение остаётся residual-записью для
++            # повторной сверки (как у BUY). append() реестра сам переводит
++            # противоречивые кумулятивные значения в UNCERTAIN (fail-closed).
++            ledger.record_status(
++                order_id, status or "SENT", executed_lots=le,
++                avg_exec_price=exec_price,
++                reason=("исполнение SELL подтверждено брокером и применено к учёту"
++                        if applied else
++                        "применение исполнению SELL отклонено учётом — требуется сверка"),
++                source="poll_sell")
++            continue
++
++        # C: NEW / неизвестный статус без исполнения — наблюдение; позиция не
++        # закрывается, вторая SELL не отправляется (защита исправления №3).
++        ledger.record_status(order_id, status or "NEW", executed_lots=le,
++                             reason="активна, под наблюдением опроса SELL",
++                             source="poll_sell")
++
+ 
+ async def promote_recovery_positions(client: TinkoffClient, monitor: ExecutionMonitor,
+                                      rm: RiskManager,

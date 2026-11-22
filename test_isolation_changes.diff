@@ -1,0 +1,667 @@
+diff --git a/tests/conftest.py b/tests/conftest.py
+index d45764f..85ac02b 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -4,12 +4,43 @@
+ # чистом CI-окружении), ставятся минимальные заглушки. В окружении
+ # репозитория (SDK установлен) заглушки НЕ используются — поведение
+ # тестового набора не меняется.
++#
++# ИЗОЛЯЦИЯ ГЛОБАЛЬНОГО СОСТОЯНИЯ main (аудит pytest-изоляции):
++#   autouse-фикстура _isolate_main_globals() сбрасывает глобальные
++#   переменные/контейнеры модуля main к чистым производственным значениям
++#   ПЕРЕД КАЖДЫМ тестом. Раньше прямые присваивания в тестах
++#   (test_main.py, test_buy_registration_fix2*, test_fail_closed.py и др.)
++#   и внутренние мутации production-функций (_save_state_checked ->
++#   state_save_failed, reconcile -> reconcile_done /
++#   _last_reconcile_confirmed_utc) переживали тест и ломали СЛЕДУЮЩИЕ
++#   тесты в зависимости от порядка прогона (test_trading_flag,
++#   test_persistence, test_main::trading_cycle).
++#   Механизм: monkeypatch.setattr на те же имена — на старте каждого
++#   теста значения чистые, после теста восстанавливаются pytest'ом.
++#   Production-код не меняется; сценарии и ожидания тестов не меняются;
++#   тест, задающий своё значение через monkeypatch/фикстуру, работает
++#   как прежде (его подмена накладывается поверх сброса).
+ 
+ import sys
+ import types
+ from datetime import datetime, timezone
+ from decimal import Decimal
+ 
++import pytest
++
++
++class _GetMaxLotsRequest:
++    """Минимальная заглушка GetMaxLotsRequest: принимает произвольные
++    keyword-аргументы, как настоящий protobuf-конструктор (production
++    tinkoff_client.get_sandbox_max_lots создаёт запрос через
++    GetMaxLotsRequest(account_id=..., instrument_id=..., price=...)).
++    Без неё в чистом CI-окружении get_sandbox_max_lots получает TypeError
++    и fail-closed возвращает None — тесты max_lots падают не из-за логики."""
++
++    def __init__(self, **kwargs):
++        for key, value in kwargs.items():
++            setattr(self, key, value)
++
+ 
+ class _EnumVal:
+     def __init__(self, name, value=None):
+@@ -66,7 +97,7 @@ def _install_stubs():
+         EXECUTION_REPORT_STATUS_PARTIALLYFILL=_EnumVal("PARTIALLYFILL", 5),
+         EXECUTION_REPORT_STATUS_EXPIRED=_EnumVal("EXPIRED", 6),
+     )
+-    invest.GetMaxLotsRequest = _EnumVal("GetMaxLotsRequest")
++    invest.GetMaxLotsRequest = _GetMaxLotsRequest
+     invest.AsyncClient = object
+ 
+     grpc = types.ModuleType("t_tech.invest.grpc")
+@@ -118,3 +149,34 @@ def _install_stubs():
+ 
+ 
+ _install_stubs()
++
++import main  # noqa: E402 — ПОСЛЕ установки заглушек SDK (см. _install_stubs)
++
++
++# ------------------------------------------------------------------
++# Общая изоляция глобального состояния main (см. шапку файла).
++# Оригиналы функций фиксируются ОДИН РАЗ при импорте conftest — ДО любых
++# подмен в тестах, чтобы подменённые MagicMock-функции не переживали тест.
++# ------------------------------------------------------------------
++
++_ORIG_IS_TRADING_ENABLED = main.is_trading_enabled
++_ORIG_SAVE_STATE = main._save_state
++
++
++@pytest.fixture(autouse=True)
++def _isolate_main_globals(monkeypatch):
++    """Сбрасывает глобальное состояние main к чистым значениям на каждый тест."""
++    monkeypatch.setattr(main, "reconcile_done", False)
++    monkeypatch.setattr(main, "state_save_failed", False)
++    monkeypatch.setattr(main, "_last_reconcile_confirmed_utc", None)
++    monkeypatch.setattr(main, "_external_close_candidates", {})
++    monkeypatch.setattr(main, "_strategy_event_keys", set())
++    monkeypatch.setattr(main, "_promote_throttle", {"n": 0, "alive": 0})
++    monkeypatch.setattr(main, "top_instruments", [])
++    monkeypatch.setattr(main, "telegram_bot", None)
++    monkeypatch.setattr(main, "main_client", None)
++    monkeypatch.setattr(main, "monitor_ref", None)
++    monkeypatch.setattr(main, "rm_ref", None)
++    monkeypatch.setattr(main, "ledger_ref", None)
++    monkeypatch.setattr(main, "is_trading_enabled", _ORIG_IS_TRADING_ENABLED)
++    monkeypatch.setattr(main, "_save_state", _ORIG_SAVE_STATE)
+diff --git a/tests/test_buy_registration_fix2 (1).py b/tests/test_buy_registration_fix2 (1).py
+index 731671b..304fb18 100644
+--- a/tests/test_buy_registration_fix2 (1).py	
++++ b/tests/test_buy_registration_fix2 (1).py	
+@@ -1001,7 +1001,14 @@ async def test_i5_save_failure_no_false_confirmation(env, monkeypatch):
+ 
+     journal_before = _journal_all_safe(ledger)
+     client.uncertain_state = False
+-    main.state_save_failed = False
++    # Изоляция (аудит pytest-изоляции): раньше прямое присваивание
++    # main.state_save_failed = False переживало тест — после него флаг
++    # state_save_failed=True (устанавливаемый _save_state_checked при
++    # ошибке сохранения) утекал в следующие тесты и блокировал входы
++    # (test_main::trading_cycle). monkeypatch восстанавливает исходное
++    # значение автоматически; проверка state_save_failed is True ниже
++    # работает как прежде (production-функция пишет в атрибут модуля).
++    monkeypatch.setattr(main, "state_save_failed", False)
+ 
+     sent = []
+ 
+diff --git a/tests/test_buy_registration_fix2.py b/tests/test_buy_registration_fix2.py
+index 731671b..304fb18 100644
+--- a/tests/test_buy_registration_fix2.py
++++ b/tests/test_buy_registration_fix2.py
+@@ -1001,7 +1001,14 @@ async def test_i5_save_failure_no_false_confirmation(env, monkeypatch):
+ 
+     journal_before = _journal_all_safe(ledger)
+     client.uncertain_state = False
+-    main.state_save_failed = False
++    # Изоляция (аудит pytest-изоляции): раньше прямое присваивание
++    # main.state_save_failed = False переживало тест — после него флаг
++    # state_save_failed=True (устанавливаемый _save_state_checked при
++    # ошибке сохранения) утекал в следующие тесты и блокировал входы
++    # (test_main::trading_cycle). monkeypatch восстанавливает исходное
++    # значение автоматически; проверка state_save_failed is True ниже
++    # работает как прежде (production-функция пишет в атрибут модуля).
++    monkeypatch.setattr(main, "state_save_failed", False)
+ 
+     sent = []
+ 
+diff --git a/tests/test_buy_registration_fix2_FIX2_snapshot.py b/tests/test_buy_registration_fix2_FIX2_snapshot.py
+index 21b0a1c..adf895e 100644
+--- a/tests/test_buy_registration_fix2_FIX2_snapshot.py
++++ b/tests/test_buy_registration_fix2_FIX2_snapshot.py
+@@ -368,6 +368,9 @@ async def test_f_recovery_notifies_unsaved_state(env, monkeypatch):
+ 
+     monkeypatch.setattr(main, "notify", spy_notify)
+     monkeypatch.setattr(main, "_save_state", lambda m, r: False)
++    # Изоляция (аудит pytest-изоляции): флаг state_save_failed, установленный
++    # _save_state_checked при ошибке сохранения, больше не переживает тест.
++    monkeypatch.setattr(main, "state_save_failed", False)
+     kw = open_kwargs(oid, trade_id="t-F", executed=4, requested=4)
+     kw["df"] = None  # без свечей -> RECOVERY
+     pos = await main.register_executed_buy(client, monitor, rm, ledger, **kw)
+@@ -421,6 +424,9 @@ async def test_g_primary_buy_unsaved_state(env, monkeypatch):
+     real_save_state = main._save_state
+     monkeypatch.setattr(main, "notify", spy_notify)
+     monkeypatch.setattr(main, "_save_state", lambda m, r: False)
++    # Изоляция (аудит pytest-изоляции): флаг state_save_failed больше не
++    # переживает тест (устанавливается production _save_state_checked ниже).
++    monkeypatch.setattr(main, "state_save_failed", False)
+     pos = await main.register_executed_buy(
+         client, monitor, rm, ledger,
+         **open_kwargs(oid, trade_id="t-G", executed=5, requested=10))
+diff --git a/tests/test_fail_closed.py b/tests/test_fail_closed.py
+index 9785f21..96492ff 100644
+--- a/tests/test_fail_closed.py
++++ b/tests/test_fail_closed.py
+@@ -55,7 +55,7 @@ async def test_reconcile_empty_ok_clears_uncertain():
+ 
+ 
+ @pytest.mark.asyncio
+-async def test_trading_cycle_blocks_entry_on_positions_error():
++async def test_trading_cycle_blocks_entry_on_positions_error(monkeypatch):
+     """
+     Если get_positions() вернул None перед входом — новые входы запрещены.
+     get_last_prices возвращает {} — trading_cycle выходит на «Нет цен» до проверки positions.
+@@ -63,7 +63,9 @@ async def test_trading_cycle_blocks_entry_on_positions_error():
+     """
+     client = FakeClient(positions=None, raise_on_positions=True)
+     mon = ExecutionMonitor(client)
+-    main.reconcile_done = True
++    # Изоляция: раньше прямое присваивание main.reconcile_done = True
++    # переживало тест. monkeypatch восстанавливает значение автоматически.
++    monkeypatch.setattr(main, "reconcile_done", True)
+     # reconcile при ошибке сохраняет UNCERTAIN и сбрасывает reconcile_done.
+     await main.reconcile(client, mon)
+     assert client.uncertain_state is True
+@@ -71,18 +73,19 @@ async def test_trading_cycle_blocks_entry_on_positions_error():
+ 
+ 
+ @pytest.mark.asyncio
+-async def test_trading_cycle_exits_on_no_prices():
++async def test_trading_cycle_exits_on_no_prices(monkeypatch):
+     """Если цен нет — цикл корректно выходит, не отправляя заявок."""
+     client = FakeClient(positions={})
+     mon = ExecutionMonitor(client)
+-    import main as m
+-    old_top = m.top_instruments
+-    m.top_instruments = []
+-    try:
+-        # Не должно падать и не должно отправлять заявок.
+-        await main.trading_cycle(client, None, None, mon)
+-    finally:
+-        m.top_instruments = old_top
++    # Изоляция: раньше ручное сохранение/восстановление top_instruments
++    # через try/finally; кроме того, цикл завершался _save_state_checked
++    # с rm=None — флаг state_save_failed переживал тест и блокировал входы
++    # в СЛЕДУЮЩИХ тестах (test_main::trading_cycle). monkeypatch
++    # восстанавливает оба значения автоматически.
++    monkeypatch.setattr(main, "top_instruments", [])
++    monkeypatch.setattr(main, "state_save_failed", False)
++    # Не должно падать и не должно отправлять заявок.
++    await main.trading_cycle(client, None, None, mon)
+ 
+ 
+ @pytest.mark.asyncio
+diff --git a/tests/test_main.py b/tests/test_main.py
+index ed03f9d..1f3ed21 100644
+--- a/tests/test_main.py
++++ b/tests/test_main.py
+@@ -159,7 +159,7 @@ async def test_process_closing_resolves_uncertain():
+ # Дополнение к tests/test_main.py
+ 
+ @pytest.mark.asyncio
+-async def test_trading_cycle_not_fill_but_executed_creates_position(monkeypatch):
++async def test_trading_cycle_not_fill_but_executed_creates_position(monkeypatch, tmp_path):
+     """
+     status=NEW (не FILL), но get_sandbox_order_state показал lots_executed > 0
+     -> создаётся TrackedPosition (этап 4.1).
+@@ -215,10 +215,29 @@ async def test_trading_cycle_not_fill_but_executed_creates_position(monkeypatch)
+     rm.export_state = MagicMock(return_value={})
+     rm.import_state = MagicMock()
+ 
+-    main.top_instruments = [{"figi": "F1", "ticker": "MVID"}]
+-    main.reconcile_done = True
+-    main.is_trading_enabled = MagicMock(return_value=True)
+-    main._save_state = MagicMock(return_value=True)
++    # Изоляция (аудит pytest-изоляции): раньше здесь были ПРЯМЫЕ присваивания
++    # main.top_instruments/reconcile_done/is_trading_enabled/_save_state —
++    # они переживали тест и ломали следующие (test_trading_flag:
++    # is_trading_enabled() возвращал MagicMock; test_persistence:
++    # _save_state подменялся MagicMock'ом без записи файла).
++    # Подмены monkeypatch восстанавливаются pytest'ом автоматически;
++    # сценарий и ожидания теста НЕ изменились.
++    # state_save_failed и ledger_ref задаются явно: trading_cycle читает их
++    # как входное состояние (fail-closed блокирует входы при
++    # state_save_failed=True, оставшемся от предыдущих тестов, и при
++    # отсутствующем реестре заявок — P0-2).
++    monkeypatch.setattr(main, "top_instruments", [{"figi": "F1", "ticker": "MVID"}])
++    monkeypatch.setattr(main, "reconcile_done", True)
++    monkeypatch.setattr(main, "state_save_failed", False)
++    monkeypatch.setattr(main, "is_trading_enabled", MagicMock(return_value=True))
++    monkeypatch.setattr(main, "_save_state", MagicMock(return_value=True))
++    # Рабочий реестр в tmp_path: шаг входов P0-2 требует доступного
++    # OrderLedger (без него вход заблокирован fail-closed — это отдельный
++    # контракт, проверяемый в других тестах); сценарий этого теста —
++    # создание позиции при не-FILL статусе с подтверждённым исполнением.
++    from order_ledger import OrderLedger
++    ledger = OrderLedger(str(tmp_path / "order_ledger.jsonl"))
++    monkeypatch.setattr(main, "ledger_ref", ledger)
+ 
+     await main.trading_cycle(fake, rm, sm, monitor)
+ 
+diff --git a/tests/test_manual_close_integration.py b/tests/test_manual_close_integration.py
+index 601b0d8..f1906c5 100644
+--- a/tests/test_manual_close_integration.py
++++ b/tests/test_manual_close_integration.py
+@@ -201,16 +201,18 @@ def env(tmp_path, monkeypatch):
+     # RECONCILE_CONFIRM_MIN_AGE_SECONDS — обязательное условие
+     # двойного подтверждения (защита от мгновенного закрытия).
+     monkeypatch.setattr(config, "RECONCILE_CONFIRM_MIN_AGE_SECONDS", 30.0)
+-    main._external_close_candidates.clear()
+-    main.reconcile_done = False
+-    main.state_save_failed = False
+-    main.telegram_bot = None
+-    main.top_instruments = []
++    # Изоляция (аудит pytest-изоляции): вместо прямых присваиваний и
++    # мутаций in-place все глобальные значения main задаются через
++    # monkeypatch — pytest восстанавливает их после каждого теста.
++    monkeypatch.setattr(main, "_external_close_candidates", {})
++    monkeypatch.setattr(main, "reconcile_done", False)
++    monkeypatch.setattr(main, "state_save_failed", False)
++    monkeypatch.setattr(main, "telegram_bot", None)
++    monkeypatch.setattr(main, "top_instruments", [])
+     ledger = OrderLedger(str(tmp_path / "order_ledger.jsonl"))
+     ledger.load()
+-    main.ledger_ref = ledger
++    monkeypatch.setattr(main, "ledger_ref", ledger)
+     yield SimpleNamespace(tmp_path=tmp_path, ledger=ledger)
+-    main._external_close_candidates.clear()
+ 
+ 
+ def fresh_monitor(pos, client):
+diff --git a/tests/test_p0_batch2_late_execution.py b/tests/test_p0_batch2_late_execution.py
+index a508a1e..13c66f5 100644
+--- a/tests/test_p0_batch2_late_execution.py
++++ b/tests/test_p0_batch2_late_execution.py
+@@ -234,21 +234,40 @@ async def test_n2_open_position_shrink_is_contradiction(env):
+ # ============================================================
+ 
+ @pytest.mark.asyncio
+-async def test_n3_unknown_figi_execution_not_registered_global_block(env):
++async def test_n3_unknown_figi_execution_not_registered_global_block(env, monkeypatch):
+     """Подтверждённое исполнение с пустым FIGI НЕ регистрируется как обычная
+     BUY-позиция: заявка остаётся UNCERTAIN, новые BUY запрещены ГЛОБАЛЬНО
+-    (в торговом цикле), существующие позиции продолжают мониториться."""
++    (в торговом цикле), существующие позиции продолжают мониториться.
++
++    Моделирование (аудит pytest-изоляции): исходный вариант пытался создать
++    INTENT с пустым FIGI через record_intent() — production-guard
++    OrderLedger.record_intent() отвергает записи без обязательных полей
++    (guard НЕ ослабляется), поэтому заявка в реестр не попадала и сценарий
++    не выполнялся. Сценарий теперь идёт штатным путём приложения: событие
++    ПОДТВЕРЖДЁННОГО исполнения (FILL, 4 лота) поступает в единую точку
++    регистрации main.register_executed_buy() БЕЗ FIGI — так же, как в
++    production (ветка P0-2); далее заявка опрашивается poll_open_orders()
++    и глобальная блокировка проверяется в полном trading_cycle."""
+     ledger = make_ledger(env.tmp_path)
+     client = FakeClient(positions={})
+     oid = "oid-nofigi"
+-    ledger.record_intent(oid, trade_id="t-nofigi", figi="", ticker=TICKER,
+-                         side="BUY", requested_lots=5)
+     client.order_states[oid] = fake_state(FILL, lots_executed=4, price_units=400)
+     monitor = ExecutionMonitor(client)
+     monitor.register(figi="BBG00EXISTING", ticker="EXIST", direction="BUY",
+                      entry_price=50.0, quantity=1, sl_price=49.0, tp_price=52.0,
+                      lot_size=1, trade_id="t-exist", entry_requested_lots=1)
+ 
++    # Реальный путь обработки подтверждённого исполнения с отсутствующим
++    # FIGI (единая точка регистрации; аналогично test_n3_register_guard_direct).
++    await main.register_executed_buy(
++        client, monitor, FakeRM(), ledger,
++        figi="", ticker=TICKER, order_id=oid, trade_id="t-nofigi",
++        reason="unit", signal_time="now", price_before_order=100.0,
++        order_send_time="now", requested_lots=5, executed_lots=4,
++        exec_price=100.0, lot_size=1, partial=False,
++        df=small_df(), source="test", ledger_status="FILL",
++    )
++    # Опрос: заявка с пустым FIGI остаётся в реестре в безопасном состоянии.
+     await main.poll_open_orders(client, monitor, FakeRM(), ledger)
+ 
+     # ПОСЛЕДСТВИЯ: позиции с пустым FIGI НЕТ
+@@ -257,16 +276,21 @@ async def test_n3_unknown_figi_execution_not_registered_global_block(env):
+     assert monitor.get_position(None) is None
+     assert client.uncertain_state is True
+     rec = ledger.latest(oid)
++    assert rec is not None, "подтверждённое исполнение потеряно молча (записи реестра нет)"
+     assert rec["status"] == "UNCERTAIN", f"статус заявки: {rec['status']}"
++    assert not rec.get("figi"), "заявка с неизвестным FIGI не должна получить FIGI"
+     assert ledger.has_unknown_figi_open_orders() is True, "глобальная блокировка не активна"
+     # существующая позиция продолжается мониториться
+     assert monitor.get_position("BBG00EXISTING").state == PositionState.OPEN
+ 
+-    # глобальная блокировка действует в торговом цикле (даже после reconcile)
+-    main.ledger_ref = ledger
++    # глобальная блокировка действует в торговом цикле (даже после reconcile):
++    # брокер показывает существующую позицию — reconcile проходит без
++    # расхождений, цикл доходит до проверки has_unknown_figi_open_orders()
++    client.positions_value = {"BBG00EXISTING": PositionData(lots=1, direction="LONG",
++                                                            raw_shares=Decimal(1))}
++    monkeypatch.setattr(main, "ledger_ref", ledger)
++    monkeypatch.setattr(main, "top_instruments", [{"figi": FIGI, "ticker": TICKER}])
+     rm, sm = FakeRM(), FakeSM("BUY")
+-    main.top_instruments.clear()
+-    main.top_instruments.extend([{"figi": FIGI, "ticker": TICKER}])
+     client.prices_value = {FIGI: 100.0}
+     await main.trading_cycle(client, rm, sm, monitor, ledger)
+     assert sm.calls == 0, "новые BUY разрешены при заявке без FIGI"
+diff --git a/tests/test_p0_defect_fixes.py b/tests/test_p0_defect_fixes.py
+index 7a8b7aa..b2602dc 100644
+--- a/tests/test_p0_defect_fixes.py
++++ b/tests/test_p0_defect_fixes.py
+@@ -230,7 +230,7 @@ async def run_entry_cycle(client, rm, sm, monitor, ledger, figi=FIGI):
+ # ============================================================
+ 
+ @pytest.mark.asyncio
+-async def test_scenario_1_partial_buy_cancelled_portfolio_silent(env):
++async def test_scenario_1_partial_buy_cancelled_portfolio_silent(env, monkeypatch):
+     """Сценарий 1 / Дефект №1: частичный BUY, остаток CANCELLED, портфель
+     ВРЕМЕННО не показывает позицию — исполнение НЕ теряется, позиция
+     регистрируется ровно в подтверждённом количестве."""
+@@ -241,8 +241,10 @@ async def test_scenario_1_partial_buy_cancelled_portfolio_silent(env):
+     monitor = ExecutionMonitor(client)
+     rm = FakeRM(sl=95.0, tp=110.0, size=5)
+     sm = FakeSM("BUY")
+-    main.monitor_ref = monitor
+-    main.ledger_ref = ledger
++    # Изоляция: подмены через monkeypatch (раньше прямые присваивания
++    # переживали тест и утекали в следующие).
++    monkeypatch.setattr(main, "monitor_ref", monitor)
++    monkeypatch.setattr(main, "ledger_ref", ledger)
+ 
+     await run_entry_cycle(client, rm, sm, monitor, ledger)
+ 
+@@ -266,7 +268,7 @@ async def test_scenario_1_partial_buy_cancelled_portfolio_silent(env):
+ 
+ 
+ @pytest.mark.asyncio
+-async def test_defect1_unavailable_portfolio_with_confirmed_lots_registers(env):
++async def test_defect1_unavailable_portfolio_with_confirmed_lots_registers(env, monkeypatch):
+     """Дефект №1 (снимок недоступен): брокер подтвердил lots_executed>0, но
+     свежий снимок портфеля ВТОРОЙ запрос вернул недостоверным — исполнение
+     всё равно регистрируется (отсутствие снимка не отменяет исполнение)."""
+@@ -278,8 +280,8 @@ async def test_defect1_unavailable_portfolio_with_confirmed_lots_registers(env):
+     monitor = ExecutionMonitor(client)
+     rm = FakeRM(sl=95.0, tp=110.0, size=5)
+     sm = FakeSM("BUY")
+-    main.monitor_ref = monitor
+-    main.ledger_ref = ledger
++    monkeypatch.setattr(main, "monitor_ref", monitor)
++    monkeypatch.setattr(main, "ledger_ref", ledger)
+ 
+     await run_entry_cycle(client, rm, sm, monitor, ledger)
+ 
+@@ -545,7 +547,15 @@ async def test_scenario_9_unknown_figi_order_blocks_buy_globally(env):
+ async def test_defect4_unknown_side_resolves_only_without_execution(env):
+     """Дефект №4 (разрешение): заявка с side=None разрешается ТОЛЬКО при
+     достоверном завершении без исполнения; при признаках исполнения остаётся
+-    UNCERTAIN (BUY не разблокируются)."""
++    UNCERTAIN (BUY не разблокируются).
++
++    Актуализация ожидания (аудит pytest-изоляции, п.5 ТЗ): противоречивый
++    сценарий (сначала брокер показал исполнение, затем «тот же» отчёт
++    утверждает завершение без исполнения) — безопасное состояние UNCERTAIN,
++    а НЕ CANCELLED: монотонный guard реестра (order_ledger.append) не даёт
++    откатить cumulative execution 2 -> 0 и fail-closed сохраняет
++    неопределённость до сверки. Достоверное разрешение БЕЗ исполнения
++    проверяется на отдельной заявке без признаков исполнения (u4)."""
+     ledger = make_ledger(env.tmp_path)
+     oid = "u3"
+     ledger.record_uncertain(oid, figi=FIGI, ticker=TICKER, side=None,
+@@ -563,28 +573,44 @@ async def test_defect4_unknown_side_resolves_only_without_execution(env):
+     # позиция НЕ регистрировалась автоматически
+     assert monitor.get_position(FIGI) is None
+ 
+-    # (б) достоверное завершение без исполнения — блокировка снимается
++    # (б) противоречивый «повторный» отчёт (исполнение 2 -> 0) — fail-closed:
++    # реестр не откатывает исполнение, заявка остаётся UNCERTAIN,
++    # блокировка BUY по FIGI сохраняется
+     client.order_states[oid] = fake_state(CANCELLED, lots_executed=0)
+     await main.poll_open_orders(client, monitor, FakeRM(), ledger)
+     rec = ledger.latest(oid)
+-    assert rec["status"] == "CANCELLED"
+-    assert ledger.figi_blocks_buy(FIGI) is False
++    assert rec["status"] == "UNCERTAIN", \
++        f"противоречивый отчёт должен сохранять fail-closed UNCERTAIN, получен {rec['status']}"
++    assert ledger.figi_blocks_buy(FIGI) is True
++
++    # (в) достоверное завершение БЕЗ исполнения заявки без признаков
++    # исполнения — блокировка по этому FIGI снимается
++    oid2 = "u4"
++    ledger.record_uncertain(oid2, figi=OTHER_FIGI, ticker="OTHER", side=None,
++                            requested_lots=5, source="startup",
++                            reason="активная заявка брокера без записи в реестре")
++    client.order_states[oid2] = fake_state(CANCELLED, lots_executed=0)
++    await main.poll_open_orders(client, monitor, FakeRM(), ledger)
++    rec2 = ledger.latest(oid2)
++    assert rec2["status"] == "CANCELLED"
++    assert ledger.figi_blocks_buy(OTHER_FIGI) is False
+ 
+ 
+ # ============================================================
+ # Дефект №5: повреждение OrderLedger не превращается в пустой реестр
+ # ============================================================
+ 
+-async def _assert_buy_blocked(env, ledger, client, monitor):
++async def _assert_buy_blocked(env, monkeypatch, ledger, client, monitor):
+     rm, sm = FakeRM(), FakeSM("BUY")
+-    main.ledger_ref = ledger
++    # Изоляция: подмена через monkeypatch вместо прямого присваивания.
++    monkeypatch.setattr(main, "ledger_ref", ledger)
+     await run_entry_cycle(client, rm, sm, monitor, ledger)
+     assert sm.calls == 0, "новые BUY не заблокированы"
+     assert client.last_post is None
+ 
+ 
+ @pytest.mark.asyncio
+-async def test_scenario_10_corrupted_ledger_blocks_buy(env):
++async def test_scenario_10_corrupted_ledger_blocks_buy(env, monkeypatch):
+     """Сценарий 10 / Дефект №5: повреждённая строка журнала (в середине) —
+     реестр недостоверен, новые BUY запрещены, журнал НЕ перезаписывается,
+     целые записи продолжают читаться (best effort)."""
+@@ -607,7 +633,7 @@ async def test_scenario_10_corrupted_ledger_blocks_buy(env):
+ 
+     client = FakeClient(positions={})
+     monitor = ExecutionMonitor(client)
+-    await _assert_buy_blocked(env, ledger, client, monitor)
++    await _assert_buy_blocked(env, monkeypatch, ledger, client, monitor)
+ 
+ 
+ @pytest.mark.asyncio
+@@ -619,6 +645,15 @@ async def test_scenario_11_ledger_read_error_blocks_buy(env, monkeypatch):
+         f.write(ledger_line("oidC", status="INTENT", figi=FIGI) + "\n")
+ 
+     ledger = OrderLedger(path)
++
++    # Изоляция (аудит pytest-изоляции): подмена builtins.open выполняется в
++    # СКОП-контексте и снимается сразу после ledger.load(). Раньше здесь был
++    # monkeypatch.undo(), который снимал ВСЕ подмены этого теста, включая
++    # изоляцию файлов диагностики (EVENTS_FILE/TRADES_FILE) и STATE_FILE из
++    # conftest-фикстур: последующий trading_cycle писал SIGNAL/RECONCILE_OK
++    # в ПРОИЗВОДСТВЕННЫЙ research_events.jsonl в корне репозитория и
++    # state.json — нарушение критерия «производственные журналы не
++    # изменяются при прогоне pytest».
+     real_open = builtins.open
+ 
+     def broken_open(file, mode="r", *a, **kwargs):
+@@ -630,19 +665,19 @@ async def test_scenario_11_ledger_read_error_blocks_buy(env, monkeypatch):
+             raise PermissionError(13, "simulated read failure")
+         return real_open(file, mode, *a, **kwargs)
+ 
+-    monkeypatch.setattr(builtins, "open", broken_open)
+-    ledger.load()
++    with monkeypatch.context() as m:
++        m.setattr(builtins, "open", broken_open)
++        ledger.load()
+     assert ledger.is_reliable() is False, "ошибка чтения не перевела реестр в недостоверность"
+     assert ledger.unreliable_reason
+-    monkeypatch.undo()
+ 
+     client = FakeClient(positions={})
+     monitor = ExecutionMonitor(client)
+-    await _assert_buy_blocked(env, ledger, client, monitor)
++    await _assert_buy_blocked(env, monkeypatch, ledger, client, monitor)
+ 
+ 
+ @pytest.mark.asyncio
+-async def test_defect5_tail_corruption_no_truncate_blocks_buy(env):
++async def test_defect5_tail_corruption_no_truncate_blocks_buy(env, monkeypatch):
+     """Дефект №5: повреждённый ХВОСТ журнала не обрезается, не молчит и
+     запрещает новые BUY до восстановления целостности."""
+     path = str(env.tmp_path / "order_ledger.jsonl")
+@@ -657,7 +692,7 @@ async def test_defect5_tail_corruption_no_truncate_blocks_buy(env):
+     assert '"trunc' in raw, "журнал был перезаписан/обрезан"
+     client = FakeClient(positions={})
+     monitor = ExecutionMonitor(client)
+-    await _assert_buy_blocked(env, ledger, client, monitor)
++    await _assert_buy_blocked(env, monkeypatch, ledger, client, monitor)
+ 
+ 
+ @pytest.mark.asyncio
+diff --git a/tests/test_persistence.py b/tests/test_persistence.py
+index e21d723..94188d7 100644
+--- a/tests/test_persistence.py
++++ b/tests/test_persistence.py
+@@ -136,6 +136,9 @@ def test_subprocess_saves_state_then_killed(state_paths, tmp_path):
+         import json, os, sys
+         sys.path.insert(0, r"{os.getcwd()}")
+         from decimal import Decimal
++        import tests.conftest  # SDK-заглушки из tests/conftest.py (no-op при реальном SDK)
++        from tests.conftest import _install_stubs
++        _install_stubs()
+         import main
+         from execution import ExecutionMonitor
+         from risk_manager import RiskManager
+@@ -186,6 +189,9 @@ def test_second_process_restores_state(state_paths):
+     save_script = textwrap.dedent(f"""
+         import sys, os
+         sys.path.insert(0, r"{os.getcwd()}")
++        import tests.conftest  # SDK-заглушки из tests/conftest.py (no-op при реальном SDK)
++        from tests.conftest import _install_stubs
++        _install_stubs()
+         import main
+         from execution import ExecutionMonitor
+         from risk_manager import RiskManager
+@@ -212,6 +218,9 @@ def test_second_process_restores_state(state_paths):
+     load_script = textwrap.dedent(f"""
+         import sys, os
+         sys.path.insert(0, r"{os.getcwd()}")
++        import tests.conftest  # SDK-заглушки из tests/conftest.py (no-op при реальном SDK)
++        from tests.conftest import _install_stubs
++        _install_stubs()
+         import main
+         from execution import ExecutionMonitor
+         from risk_manager import RiskManager
+diff --git a/tests/test_stage1_packet_v.py b/tests/test_stage1_packet_v.py
+index 165ee0e..7cfcf7f 100644
+--- a/tests/test_stage1_packet_v.py
++++ b/tests/test_stage1_packet_v.py
+@@ -88,9 +88,10 @@ def isolated_paths(tmp_path, monkeypatch):
+     monkeypatch.setattr(research_logger, "TRADES_FILE", str(tmp_path / "research_trades.csv"))
+     monkeypatch.setattr(main, "STATE_FILE", str(tmp_path / "state.json"))
+     monkeypatch.setattr(main, "STATE_FILE_TMP", str(tmp_path / "state.json.tmp"))
+-    main._external_close_candidates.clear()
++    # Изоляция: подмена словаря кандидатов В3 через monkeypatch вместо
++    # прямого clear() (раньше мутация переживала тест при падении).
++    monkeypatch.setattr(main, "_external_close_candidates", {})
+     yield tmp_path
+-    main._external_close_candidates.clear()
+ 
+ 
+ def make_buy_pos(**over):
+diff --git a/tests/test_v232_close_defects.py b/tests/test_v232_close_defects.py
+index 34b1bd6..124bee7 100644
+--- a/tests/test_v232_close_defects.py
++++ b/tests/test_v232_close_defects.py
+@@ -214,16 +214,18 @@ def env(tmp_path, monkeypatch):
+     monkeypatch.setattr(main, "STATE_FILE_TMP", str(tmp_path / "state.json.tmp"))
+     monkeypatch.setattr(main, "TRADING_FLAG", str(tmp_path / "trading.flag"))
+     monkeypatch.setattr(config, "RECONCILE_CONFIRM_MIN_AGE_SECONDS", MIN_AGE)
+-    main._external_close_candidates.clear()
+-    main.reconcile_done = False
+-    main.state_save_failed = False
+-    main.telegram_bot = None
+-    main.top_instruments = []
++    # Изоляция (аудит pytest-изоляции): вместо прямых присваиваний и
++    # мутаций in-place все глобальные значения main задаются через
++    # monkeypatch — pytest восстанавливает их после каждого теста.
++    monkeypatch.setattr(main, "_external_close_candidates", {})
++    monkeypatch.setattr(main, "reconcile_done", False)
++    monkeypatch.setattr(main, "state_save_failed", False)
++    monkeypatch.setattr(main, "telegram_bot", None)
++    monkeypatch.setattr(main, "top_instruments", [])
+     ledger = OrderLedger(str(tmp_path / "order_ledger.jsonl"))
+     ledger.load()
+-    main.ledger_ref = ledger
++    monkeypatch.setattr(main, "ledger_ref", ledger)
+     yield SimpleNamespace(tmp_path=tmp_path, ledger=ledger)
+-    main._external_close_candidates.clear()
+ 
+ 
+ def fresh_monitor(pos, client):
+@@ -509,7 +511,7 @@ def test_defect2_5_none_snapshot_neither_confirms_nor_resets(env):
+     assert broker.orders_sent == []
+ 
+ 
+-def test_defect2_6_restart_between_confirmations_no_instant_close(env):
++def test_defect2_6_restart_between_confirmations_no_instant_close(env, monkeypatch):
+     """Сценарий 6: рестарт между первым и вторым подтверждением.
+     Кандидаты В3 не персистятся (консервативно): после рестарта мгновенного
+     закрытия НЕТ — двойное подтверждение начинается заново (два новых
+@@ -533,8 +535,10 @@ def test_defect2_6_restart_between_confirmations_no_instant_close(env):
+     monitor2.import_state(json.load(open(tmp_path / "state.json", encoding="utf-8")))
+     pos2 = monitor2.positions["F1"]
+     assert pos2.state == PositionState.UNCERTAIN      # UNCERTAIN пережил рестарт
+-    main._external_close_candidates.clear()           # in-memory кандидаты не персистятся
+-    main.reconcile_done = False
++    # in-memory кандидаты не персистятся (изоляция: мутация через monkeypatch
++    # вместо прямого clear/присваивания, чтобы не переживать тест)
++    monkeypatch.setattr(main, "_external_close_candidates", {})
++    monkeypatch.setattr(main, "reconcile_done", False)
+ 
+     # --- цикл 2 (после рестарта): мгновенного закрытия НЕТ ---
+     run(main.trading_cycle(broker, rm, None, monitor2, ledger))
+diff --git a/tests/test_v233_partial_sell_reopen_defect.py b/tests/test_v233_partial_sell_reopen_defect.py
+index a661eed..f55551a 100644
+--- a/tests/test_v233_partial_sell_reopen_defect.py
++++ b/tests/test_v233_partial_sell_reopen_defect.py
+@@ -216,16 +216,18 @@ def env(tmp_path, monkeypatch):
+     monkeypatch.setattr(main, "STATE_FILE_TMP", str(tmp_path / "state.json.tmp"))
+     monkeypatch.setattr(main, "TRADING_FLAG", str(tmp_path / "trading.flag"))
+     monkeypatch.setattr(config, "RECONCILE_CONFIRM_MIN_AGE_SECONDS", 30.0)
+-    main._external_close_candidates.clear()
+-    main.reconcile_done = False
+-    main.state_save_failed = False
+-    main.telegram_bot = None
+-    main.top_instruments = []
++    # Изоляция (аудит pytest-изоляции): вместо прямых присваиваний и
++    # мутаций in-place все глобальные значения main задаются через
++    # monkeypatch — pytest восстанавливает их после каждого теста.
++    monkeypatch.setattr(main, "_external_close_candidates", {})
++    monkeypatch.setattr(main, "reconcile_done", False)
++    monkeypatch.setattr(main, "state_save_failed", False)
++    monkeypatch.setattr(main, "telegram_bot", None)
++    monkeypatch.setattr(main, "top_instruments", [])
+     ledger = OrderLedger(str(tmp_path / "order_ledger.jsonl"))
+     ledger.load()
+-    main.ledger_ref = ledger
++    monkeypatch.setattr(main, "ledger_ref", ledger)
+     yield SimpleNamespace(tmp_path=tmp_path, ledger=ledger)
+-    main._external_close_candidates.clear()
+ 
+ 
+ def fresh_monitor(pos, client):

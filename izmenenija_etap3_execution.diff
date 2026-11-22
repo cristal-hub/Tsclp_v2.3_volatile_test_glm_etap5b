@@ -1,0 +1,130 @@
+--- ../_stage3_originals/execution.py	2026-11-22 16:32:44.579703104 +0000
++++ execution.py	2026-11-22 16:40:36.671867223 +0000
+@@ -73,6 +73,24 @@
+ #   объект -> None + диагностическое сообщение (fail-closed); автоматическое
+ #   применение формулы одного типа к другому исключено. Торговая логика
+ #   (SL/TP, закрытия, промоция, регистрация) не менялась.
++#
++# ИЗМЕНЕНИЯ (SAFETY FIX ЭТАП 3 — обработка неопределённого исполнения SELL):
++#   1. resolve_uncertain(): отсутствие позиции в портфеле при НЕЗАВЕРШЁННОЙ/
++#      НЕОПРЕДЕЛЁННОЙ SELL-заявке (close_order_id или незавершённая запись
++#      close_orders) БОЛЬШЕ НЕ переводит позицию в CLOSED: NOT_FOUND/None/
++#      timeout не доказывают исполнение SELL. Позиция остаётся UNCERTAIN
++#      с сохранением количества/FIGI/entry price и связи с order_id SELL;
++#      заявка доступна последующему опросу; P&L не формируется
++#      (исход "SELL_CLOSURE_UNCONFIRMED" возвращается вызывающему коду).
++#      Отсутствие позиции БЕЗ незавершённой SELL — внешнее закрытие
++#      (EXTERNAL_CLOSE): учёт закрывается БЕЗ торговой CSV-строки и БЕЗ P&L
++#      (logged=True, close_reason="EXTERNAL_CLOSE").
++#   2. Новая функция has_unresolved_sell(pos): признак незавершённой/
++#      неопределённой SELL (активный курсор close_order_id или
++#      нетерминальная запись close_orders); используется resolve_uncertain
++#      и защитой от повторной SELL в main.py (симметрично figi_blocks_buy).
++#   Остальная логика (apply_close_execution, resolve_closing, регистрация,
++#   промоция RECOVERY) не менялась.
+ import logging
+ import math
+ from unittest.mock import Mock as _MockBase
+@@ -91,6 +109,37 @@
+     RECOVERY = "RECOVERY"
+ 
+ 
++# SAFETY FIX ЭТАП 3: терминальные статусы SELL-заявки. Согласованы с
++# order_ledger.TERMINAL_STATUSES и маппингом статусов в main.py.
++SELL_TERMINAL_STATUSES = {"FILL", "REJECTED", "CANCELLED", "EXPIRED"}
++
++
++def has_unresolved_sell(pos) -> bool:
++    """
++    SAFETY FIX ЭТАП 3: есть ли у позиции незавершённая/неопределённая
++    SELL-заявка (fail-closed).
++
++    True, если:
++      - активный курсор close_order_id установлен — связь с SELL, которая
++        не была достоверно разрешена (полный FILL переводит позицию в CLOSED
++        мимо этой проверки; терминальные отказы и частичное терминальное
++        исполнение снимают курсор штатными путями resolve_closing /
++        apply_close_execution; NOT_FOUND/None курсор НЕ снимают);
++      - или в журнале close_orders есть запись с нетерминальным статусом
++        (INTENT/SENT/NEW/PARTIALLYFILL/UNCERTAIN/неизвестный).
++    Записи с терминальным статусом (FILL/CANCELLED/REJECTED/EXPIRED) без
++    активного курсора незавершённую SELL не образуют.
++    """
++    if pos is None:
++        return False
++    if pos.close_order_id:
++        return True
++    for rec in (pos.close_orders or {}).values():
++        if str(rec.get("status") or "").upper() not in SELL_TERMINAL_STATUSES:
++            return True
++    return False
++
++
+ ACTIVE_STATES = (
+     PositionState.OPEN, PositionState.CLOSING,
+     PositionState.UNCERTAIN, PositionState.RECOVERY,
+@@ -570,20 +619,61 @@
+             pos.state = PositionState.UNCERTAIN
+ 
+     def resolve_uncertain(self, pos, broker_positions):
++        """
++        Разрешение UNCERTAIN-позиции по достоверному снимку портфеля.
++
++        SAFETY FIX ЭТАП 3 (исправления №1 и №8):
++          - отсутствие позиции в портфеле при НЕЗАВЕРШЁННОЙ/НЕОПРЕДЕЛЁННОЙ
++            SELL-заявке (close_order_id или незавершённая запись close_orders)
++            БОЛЬШЕ НЕ закрывает позицию как CLOSED: NOT_FOUND/None/timeout и
++            само по себе отсутствие позиции не доказывают исполнение SELL.
++            Позиция остаётся UNCERTAIN: количество, FIGI, entry price и связь
++            с order_id SELL сохраняются; заявка остаётся доступной опросу;
++            P&L не формируется (state != CLOSED — CSV-блок не выполняется).
++            Сверка reconcile продолжает показывать расхождение (позиция
++            активна, у брокера отсутствует) — неопределённость остаётся
++            явно видимой. Исход возвращается как "SELL_CLOSURE_UNCONFIRMED".
++          - отсутствие позиции при ОТСУТСТВИИ незавершённой SELL — внешнее
++            закрытие (EXTERNAL_CLOSE): исполнение конкретной заявки робота
++            не подтверждалось, поэтому событие НЕ записывается как обычная
++            торговая сделка: учёт закрывается (quantity=0, CLOSED) с
++            logged=True (CSV-строка с P&L не пишется) и маркером
++            close_reason="EXTERNAL_CLOSE". Исход — "EXTERNAL_CLOSE".
++        Остальные ветки (брокер показывает позицию) не менялись.
++
++        Возвращает строку исхода: "SELL_CLOSURE_UNCONFIRMED" |
++        "EXTERNAL_CLOSE" | "OPEN" | "UNCERTAIN".
++        """
+         broker = broker_positions.get(pos.figi)
+         if broker is None:
++            if has_unresolved_sell(pos):
++                logging.error(
++                    f"[execution] {pos.ticker}: позиции нет в портфеле, но SELL "
++                    f"{pos.close_order_id or '(незавершённая запись close_orders)'} "
++                    f"не подтверждена — закрытие НЕ подтверждено, позиция остаётся "
++                    f"UNCERTAIN (qty={pos.quantity}, figi={pos.figi})"
++                )
++                pos.state = PositionState.UNCERTAIN
++                return "SELL_CLOSURE_UNCONFIRMED"
++            logging.warning(
++                f"[execution] {pos.ticker}: позиции нет в портфеле, незавершённой "
++                f"SELL нет — внешнее закрытие (EXTERNAL_CLOSE), без P&L"
++            )
+             pos.quantity = 0
+             pos.state = PositionState.CLOSED
+-            return
++            pos.close_reason = "EXTERNAL_CLOSE"
++            pos.logged = True  # обычная строка сделки с P&L не формируется
++            return "EXTERNAL_CLOSE"
+         if getattr(broker, "direction", "UNKNOWN") == "UNKNOWN":
+             pos.state = PositionState.UNCERTAIN
+-            return
++            return "UNCERTAIN"
+         expected = "LONG" if pos.direction == "BUY" else "SHORT"
+         if broker.direction != expected or abs(int(broker.lots)) != pos.quantity:
+             pos.state = PositionState.UNCERTAIN
+-            return
++            return "UNCERTAIN"
+         pos.quantity = abs(int(broker.lots))
+         pos.state = PositionState.OPEN
++        return "OPEN"
+ 
+     # ============================================================
+     # PRICE FIX: раздельное преобразование цены исполнения.
